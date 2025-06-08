@@ -1,0 +1,174 @@
+name: Build VoceChat Server for Windows
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        target: 
+          - x86_64-pc-windows-msvc
+          - x86_64-pc-windows-gnu
+        include:
+          - target: x86_64-pc-windows-msvc
+            toolchain: stable-msvc
+          - target: x86_64-pc-windows-gnu
+            toolchain: stable-gnu
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ matrix.toolchain }}
+        targets: ${{ matrix.target }}
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ matrix.target }}-
+          ${{ runner.os }}-cargo-
+
+    - name: Install system dependencies (if needed)
+      shell: powershell
+      run: |
+        # 安装可能需要的系统依赖
+        # choco install sqlite -y
+        echo "Installing system dependencies..."
+
+    - name: Build project
+      run: |
+        cargo build --release --target ${{ matrix.target }}
+
+    - name: Run tests
+      run: |
+        cargo test --target ${{ matrix.target }}
+
+    - name: Create artifact directory
+      shell: powershell
+      run: |
+        New-Item -ItemType Directory -Force -Path artifact
+        $binaryName = if ("${{ matrix.target }}" -eq "x86_64-pc-windows-msvc") { "vocechat-server-windows-msvc.exe" } else { "vocechat-server-windows-gnu.exe" }
+        Copy-Item "target/${{ matrix.target }}/release/vocechat-server.exe" "artifact/$binaryName"
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: vocechat-server-${{ matrix.target }}
+        path: artifact/
+        retention-days: 30
+
+  build-cross-platform:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - i686-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Install cross-compilation tools
+      run: |
+        cargo install cross --git https://github.com/cross-rs/cross
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cross-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cross compile
+      run: |
+        cross build --release --target ${{ matrix.target }}
+
+    - name: Prepare artifact
+      run: |
+        mkdir -p artifact
+        cp target/${{ matrix.target }}/release/vocechat-server.exe artifact/vocechat-server-${{ matrix.target }}.exe
+
+    - name: Upload cross-compiled artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: vocechat-server-cross-${{ matrix.target }}
+        path: artifact/
+        retention-days: 30
+
+  create-release:
+    needs: [build-windows, build-cross-platform]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts/
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: artifacts/*/*
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: build-windows
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Login to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: |
+          ${{ secrets.DOCKER_USERNAME }}/vocechat-server:latest
+          ${{ secrets.DOCKER_USERNAME }}/vocechat-server:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
